@@ -4,6 +4,20 @@ from typing import List
 
 import streamlit as st
 
+import io
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import landscape, letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+except Exception:  # pragma: no cover
+    # If reportlab isn't installed yet, PDF export will be disabled gracefully.
+    colors = None  # type: ignore[assignment]
+    landscape = letter = None  # type: ignore[assignment]
+    getSampleStyleSheet = None  # type: ignore[assignment]
+    Paragraph = SimpleDocTemplate = Table = TableStyle = None  # type: ignore[assignment]
+
 
 def init_session_state() -> None:
     if "step" not in st.session_state:
@@ -16,6 +30,8 @@ def init_session_state() -> None:
         st.session_state.teams: List[List[str]] = []
     if "groups" not in st.session_state:
         st.session_state.groups: List[List[List[str]]] = []
+    if "schedule" not in st.session_state:
+        st.session_state.schedule: List[dict] = []
 
 
 def reset_all() -> None:
@@ -24,6 +40,7 @@ def reset_all() -> None:
     st.session_state.participants = []
     st.session_state.teams = []
     st.session_state.groups = []
+    st.session_state.schedule = []
 
 
 def parse_participants(raw: str) -> List[str]:
@@ -87,6 +104,16 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
     We generate proper "rounds" (time slots) inside each group where
     each team appears at most once per round, then flatten by round.
     """
+    def round_to_time(round_num: int, start_hour: int = 9, start_minute: int = 0, interval_minutes: int = 30) -> str:
+        total_minutes = start_hour * 60 + start_minute + (round_num - 1) * interval_minutes
+        hour_24 = (total_minutes // 60) % 24
+        minute = total_minutes % 60
+        ampm = "AM" if hour_24 < 12 else "PM"
+        hour_12 = hour_24 % 12
+        if hour_12 == 0:
+            hour_12 = 12
+        return f"{hour_12}:{minute:02d} {ampm}"
+
     all_matches: List[dict] = []
 
     for gi, group in enumerate(groups, start=1):
@@ -118,11 +145,12 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
             for match_index, (a_idx, b_idx) in enumerate(round_pairs, start=1):
                 team_a = " & ".join(group[a_idx])
                 team_b = " & ".join(group[b_idx])
+                match_time = round_to_time(round_num)
                 all_matches.append(
                     {
                         "Round": round_num,
+                        "Match Time": match_time,
                         "Group": f"Group {gi}",
-                        "Match #": match_index,
                         "Team A": team_a,
                         "Team B": team_b,
                     }
@@ -135,9 +163,62 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
             current = [fixed, *rest]
             round_num += 1
 
-    # Sort by round then group for a clean global schedule
-    all_matches.sort(key=lambda m: (m["Round"], m["Group"], m["Match #"]))
+    # Sort by round then group for a clean global schedule.
+    # Sort is stable, so match ordering within the same round/group is preserved.
+    all_matches.sort(key=lambda m: (m["Round"], m["Group"]))
     return all_matches
+
+
+def create_full_schedule(groups: List[List[List[str]]]) -> List[dict]:
+    """
+    Full Round 1 schedule including intra-group round-robin,
+    followed by semi-finals and final (group-winner placeholders).
+    """
+    schedule = create_round_robin_schedule(groups)
+
+    # Semi-finals and final are fixed at 4:00pm and 4:30pm respectively.
+    # We assume 4 groups (as per the UI). If fewer groups exist,
+    # we still show the placeholders for missing groups.
+    group_count = len(groups)
+
+    def winner_text(gi: int) -> str:
+        # gi is 1-based
+        return f"Group {gi} winner"
+
+    # Semi-final 1: Group 1 winner vs Group 2 winner (4:00 PM)
+    schedule.append(
+        {
+            "Round": "Semi-final1",
+            "Match Time": "4:00 PM",
+            "Group": "",
+            "Team A": winner_text(1),
+            "Team B": winner_text(2),
+        }
+    )
+
+    # Semi-final 2: Group 3 winner vs Group 4 winner (4:00 PM)
+    schedule.append(
+        {
+            "Round": "Semi-final2",
+            "Match Time": "4:00 PM",
+            "Group": "",
+            "Team A": winner_text(3),
+            "Team B": winner_text(4),
+        }
+    )
+
+    # Final: Semi-final 1 winner vs Semi-final 2 winner (4:30 PM)
+    schedule.append(
+        {
+            "Round": "Final",
+            "Match Time": "4:30 PM",
+            "Group": "",
+            "Team A": "Semi-final1 winner",
+            "Team B": "Semi-final2 winner",
+        }
+    )
+
+    return schedule
 
 
 def apply_custom_theme() -> None:
@@ -392,6 +473,7 @@ def page_enter_participants() -> None:
         st.session_state.participants = participants
         st.session_state.teams = create_teams(participants)
         st.session_state.groups = []
+        st.session_state.schedule = []
 
         if not participants:
             st.warning("Please enter at least two participant names.")
@@ -443,13 +525,20 @@ def page_teams() -> None:
             st.session_state.step = 1
             st.rerun()
     with col_next:
-        if st.button("Create groups"):
-            shuffled_teams = st.session_state.teams[:]
-            random.shuffle(shuffled_teams)
-            st.session_state.teams = shuffled_teams
-            st.session_state.groups = create_groups(shuffled_teams, num_groups=4)
-            st.session_state.step = 3
-            st.rerun()
+        if st.session_state.groups:
+            # Groups are already created; keep them stable across navigation.
+            if st.button("View groups"):
+                st.session_state.step = 3
+                st.rerun()
+        else:
+            if st.button("Create groups"):
+                shuffled_teams = st.session_state.teams[:]
+                random.shuffle(shuffled_teams)
+                st.session_state.groups = create_groups(shuffled_teams, num_groups=4)
+                # New groups -> new schedule is required
+                st.session_state.schedule = []
+                st.session_state.step = 3
+                st.rerun()
 
 
 def page_groups() -> None:
@@ -466,8 +555,12 @@ def page_groups() -> None:
         groups = st.session_state.groups
     else:
         num_groups = 4
-        groups = create_groups(st.session_state.teams, num_groups=num_groups)
+        shuffled_teams = st.session_state.teams[:]
+        random.shuffle(shuffled_teams)
+        groups = create_groups(shuffled_teams, num_groups=num_groups)
         st.session_state.groups = groups
+        # New groups -> new schedule is required
+        st.session_state.schedule = []
 
     total_groups = len(groups)
     st.markdown(
@@ -499,17 +592,23 @@ def page_schedule() -> None:
             # If groups were not explicitly created yet, create them once (randomized)
             shuffled_teams = st.session_state.teams[:]
             random.shuffle(shuffled_teams)
-            st.session_state.teams = shuffled_teams
             st.session_state.groups = create_groups(shuffled_teams, num_groups=4)
+            st.session_state.schedule = []
         else:
             st.info("No groups defined yet. Please start by entering participants.")
             st.session_state.step = 1
             st.rerun()
 
-    st.subheader("Step 4 · Round 1 schedule")
-    st.caption("Each group plays a full round-robin: every team faces every other team in its group once.")
+    st.subheader("Step 4 · Tournament schedule (Round 1 + Knockouts)")
+    st.caption("Round-robin within each group, then semi-finals at 4:00 PM and final at 4:30 PM.")
 
-    schedule = create_round_robin_schedule(st.session_state.groups)
+    if (
+        not st.session_state.schedule
+        or not any(str(row.get("Round", "")).startswith("Semi-final") for row in st.session_state.schedule)
+    ):
+        st.session_state.schedule = create_full_schedule(st.session_state.groups)
+
+    schedule = st.session_state.schedule
     if not schedule:
         st.warning("Not enough teams to generate any matches.")
         return
@@ -522,6 +621,85 @@ def page_schedule() -> None:
 
     # Show schedule as a themed table without extra empty lines
     st.table(schedule)
+
+    # Export as PDF
+    if colors is None:
+        st.info("Install `reportlab` to enable PDF export.")
+    else:
+        def build_pdf_bytes(schedule_rows: List[dict]) -> bytes:
+            # Column order for both on-screen table and PDF export
+            columns = ["Round", "Match Time", "Group", "Team A", "Team B"]
+
+            styles = getSampleStyleSheet()
+            header_style = styles["Heading4"]
+            header_style.textColor = colors.black
+            header_style.fontName = "Helvetica-Bold"
+
+            cell_style = styles["BodyText"]
+            cell_style.fontSize = 8
+            cell_style.leading = 9
+            cell_style.textColor = colors.black
+            cell_style.spaceAfter = 0
+
+            def esc(text: str) -> str:
+                # ReportLab Paragraph supports a small subset of HTML-like tags.
+                # Escape special characters so team names like "A & B" render safely.
+                return (
+                    text.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+
+            data = [[Paragraph(col, header_style) for col in columns]]
+            for row in schedule_rows:
+                data.append(
+                    [
+                        Paragraph(esc(str(row.get(col, ""))), cell_style)
+                        for col in columns
+                    ]
+                )
+
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(
+                buffer,
+                pagesize=landscape(letter),
+                leftMargin=18,
+                rightMargin=18,
+                topMargin=18,
+                bottomMargin=18,
+            )
+
+            # Approximate column widths for landscape page
+            col_widths = [62, 90, 70, 230, 230]
+            table = Table(data, colWidths=col_widths, repeatRows=1)
+            table.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.white),
+                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                        ("TEXTCOLOR", (0, 1), (-1, -1), colors.black),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                        ("TOPPADDING", (0, 0), (-1, -1), 2),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                    ]
+                )
+            )
+
+            doc.build([table])
+            return buffer.getvalue()
+
+        pdf_bytes = build_pdf_bytes(schedule)
+        st.download_button(
+            label="Export schedule PDF",
+            data=pdf_bytes,
+            file_name="pickleball_round1_schedule.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
     col_back, col_clear = st.columns(2)
     with col_back:
