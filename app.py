@@ -1,8 +1,13 @@
 import itertools
 import random
 from typing import List
+import json
+from pathlib import Path
 
 import streamlit as st
+import pandas as pd
+STATE_FILE = Path(__file__).with_name(".tournament_state.json")
+
 
 import io
 
@@ -10,13 +15,13 @@ try:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import landscape, letter
     from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 except Exception:  # pragma: no cover
     # If reportlab isn't installed yet, PDF export will be disabled gracefully.
     colors = None  # type: ignore[assignment]
     landscape = letter = None  # type: ignore[assignment]
     getSampleStyleSheet = None  # type: ignore[assignment]
-    Paragraph = SimpleDocTemplate = Table = TableStyle = None  # type: ignore[assignment]
+    Paragraph = SimpleDocTemplate = Spacer = Table = TableStyle = None  # type: ignore[assignment]
 
 
 def init_session_state() -> None:
@@ -32,6 +37,13 @@ def init_session_state() -> None:
         st.session_state.groups: List[List[List[str]]] = []
     if "schedule" not in st.session_state:
         st.session_state.schedule: List[dict] = []
+    if "state_loaded" not in st.session_state:
+        st.session_state.state_loaded = False
+
+    # Restore persisted app state once per Streamlit session.
+    if not st.session_state.state_loaded:
+        load_persisted_state()
+        st.session_state.state_loaded = True
 
 
 def reset_all() -> None:
@@ -41,6 +53,48 @@ def reset_all() -> None:
     st.session_state.teams = []
     st.session_state.groups = []
     st.session_state.schedule = []
+    clear_persisted_state()
+
+
+def load_persisted_state() -> None:
+    if not STATE_FILE.exists():
+        return
+
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    st.session_state.step = data.get("step", 1)
+    st.session_state.participants_raw = data.get("participants_raw", "")
+    st.session_state.participants = data.get("participants", [])
+    st.session_state.teams = data.get("teams", [])
+    st.session_state.groups = data.get("groups", [])
+    st.session_state.schedule = data.get("schedule", [])
+
+
+def save_persisted_state() -> None:
+    data = {
+        "step": st.session_state.get("step", 1),
+        "participants_raw": st.session_state.get("participants_raw", ""),
+        "participants": st.session_state.get("participants", []),
+        "teams": st.session_state.get("teams", []),
+        "groups": st.session_state.get("groups", []),
+        "schedule": st.session_state.get("schedule", []),
+    }
+    try:
+        STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        # Best-effort persistence; app should still work without filesystem access.
+        pass
+
+
+def clear_persisted_state() -> None:
+    try:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+    except Exception:
+        pass
 
 
 def parse_participants(raw: str) -> List[str]:
@@ -61,6 +115,39 @@ def parse_participants(raw: str) -> List[str]:
             seen.add(name.lower())
             unique.append(name)
     return unique
+
+
+def parse_participants_from_excel(uploaded_file) -> List[str]:
+    if uploaded_file is None:
+        return []
+
+    df = pd.read_excel(uploaded_file)
+    if df.empty:
+        return []
+
+    # Use first non-empty column as participant names
+    target_col = None
+    for col in df.columns:
+        if df[col].notna().any():
+            target_col = col
+            break
+    if target_col is None:
+        return []
+
+    seen = set()
+    participants = []
+    for value in df[target_col].tolist():
+        if pd.isna(value):
+            continue
+        name = str(value).strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        participants.append(name)
+    return participants
 
 
 def create_teams(participants: List[str]) -> List[List[str]]:
@@ -104,8 +191,8 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
     We generate proper "rounds" (time slots) inside each group where
     each team appears at most once per round, then flatten by round.
     """
-    def round_to_time(round_num: int, start_hour: int = 9, start_minute: int = 0, interval_minutes: int = 30) -> str:
-        total_minutes = start_hour * 60 + start_minute + (round_num - 1) * interval_minutes
+    def slot_to_time(slot_num: int, start_hour: int = 12, start_minute: int = 0, interval_minutes: int = 30) -> str:
+        total_minutes = start_hour * 60 + start_minute + slot_num * interval_minutes
         hour_24 = (total_minutes // 60) % 24
         minute = total_minutes % 60
         ampm = "AM" if hour_24 < 12 else "PM"
@@ -115,6 +202,7 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
         return f"{hour_12}:{minute:02d} {ampm}"
 
     all_matches: List[dict] = []
+    group_matches_map: dict[int, List[dict]] = {}
 
     for gi, group in enumerate(groups, start=1):
         team_indices = list(range(len(group)))
@@ -131,7 +219,7 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
         num_rounds = n - 1
 
         current = team_indices[:]
-        round_num = 1
+        group_match_rows: List[dict] = []
 
         for _ in range(num_rounds):
             round_pairs = []
@@ -142,14 +230,12 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
                     continue
                 round_pairs.append((a, b))
 
-            for match_index, (a_idx, b_idx) in enumerate(round_pairs, start=1):
+            for _, (a_idx, b_idx) in enumerate(round_pairs, start=1):
                 team_a = " & ".join(group[a_idx])
                 team_b = " & ".join(group[b_idx])
-                match_time = round_to_time(round_num)
-                all_matches.append(
+                group_match_rows.append(
                     {
-                        "Round": round_num,
-                        "Match Time": match_time,
+                        "Round": "Round 1",
                         "Group": f"Group {gi}",
                         "Team A": team_a,
                         "Team B": team_b,
@@ -161,11 +247,44 @@ def create_round_robin_schedule(groups: List[List[List[str]]]) -> List[dict]:
             rest = current[1:]
             rest = [rest[-1], *rest[:-1]]
             current = [fixed, *rest]
-            round_num += 1
+        group_matches_map[gi] = group_match_rows
 
-    # Sort by round then group for a clean global schedule.
-    # Sort is stable, so match ordering within the same round/group is preserved.
-    all_matches.sort(key=lambda m: (m["Round"], m["Group"]))
+    # Fixed-court queues:
+    # - Court 1 queue interleaves Group 1 and Group 2 matches.
+    # - Court 2 queue interleaves Group 3 and Group 4 matches.
+    # This preserves "each group plays only within its own group"
+    # and ensures no group match gets dropped.
+    court1_queue: List[dict] = []
+    court2_queue: List[dict] = []
+
+    for i in range(max(len(group_matches_map.get(1, [])), len(group_matches_map.get(2, [])))):
+        if i < len(group_matches_map.get(1, [])):
+            court1_queue.append(group_matches_map[1][i])
+        if i < len(group_matches_map.get(2, [])):
+            court1_queue.append(group_matches_map[2][i])
+
+    for i in range(max(len(group_matches_map.get(3, [])), len(group_matches_map.get(4, [])))):
+        if i < len(group_matches_map.get(3, [])):
+            court2_queue.append(group_matches_map[3][i])
+        if i < len(group_matches_map.get(4, [])):
+            court2_queue.append(group_matches_map[4][i])
+
+    total_slots = max(len(court1_queue), len(court2_queue))
+    for slot_num in range(total_slots):
+        time_label = slot_to_time(slot_num)
+
+        if slot_num < len(court1_queue):
+            row_c1 = court1_queue[slot_num]
+            row_c1["Match Time"] = time_label
+            row_c1["Court"] = "Court 1"
+            all_matches.append(row_c1)
+
+        if slot_num < len(court2_queue):
+            row_c2 = court2_queue[slot_num]
+            row_c2["Match Time"] = time_label
+            row_c2["Court"] = "Court 2"
+            all_matches.append(row_c2)
+
     return all_matches
 
 
@@ -191,6 +310,7 @@ def create_full_schedule(groups: List[List[List[str]]]) -> List[dict]:
             "Round": "Semi-final1",
             "Match Time": "4:00 PM",
             "Group": "",
+            "Court": "Court 1",
             "Team A": winner_text(1),
             "Team B": winner_text(2),
         }
@@ -202,6 +322,7 @@ def create_full_schedule(groups: List[List[List[str]]]) -> List[dict]:
             "Round": "Semi-final2",
             "Match Time": "4:00 PM",
             "Group": "",
+            "Court": "Court 2",
             "Team A": winner_text(3),
             "Team B": winner_text(4),
         }
@@ -213,10 +334,14 @@ def create_full_schedule(groups: List[List[List[str]]]) -> List[dict]:
             "Round": "Final",
             "Match Time": "4:30 PM",
             "Group": "",
+            "Court": "Court 1",
             "Team A": "Semi-final1 winner",
             "Team B": "Semi-final2 winner",
         }
     )
+
+    # Add 1-based index as the first column.
+    schedule = [{"Index": i, **row} for i, row in enumerate(schedule, start=1)]
 
     return schedule
 
@@ -453,34 +578,30 @@ def render_sidebar() -> None:
 
 def page_enter_participants() -> None:
     st.subheader("Step 1 · Enter participants")
-    st.caption(
-        "Paste or type one participant per line, or separate names with commas. "
-        "Teams of two will be created automatically."
-    )
+    st.caption("Upload an Excel sheet with participant names in one column.")
 
     with st.form("participants_form"):
-        participants_raw = st.text_area(
-            "Player names",
-            value=st.session_state.participants_raw,
-            height=200,
-            placeholder="Example:\nAlex\nJordan\nSam\nPriya\n...",
+        uploaded_file = st.file_uploader(
+            "Upload participants Excel file",
+            type=["xlsx", "xls"],
+            help="First non-empty column will be used as participant names.",
         )
         submitted = st.form_submit_button("Create teams")
 
     if submitted:
-        participants = parse_participants(participants_raw)
-        st.session_state.participants_raw = participants_raw
+        participants = parse_participants_from_excel(uploaded_file)
+        st.session_state.participants_raw = ""
         st.session_state.participants = participants
         st.session_state.teams = create_teams(participants)
         st.session_state.groups = []
         st.session_state.schedule = []
 
         if not participants:
-            st.warning("Please enter at least two participant names.")
+            st.warning("Please upload a valid Excel file with at least two participant names.")
             return
 
         if len(participants) < 2:
-            st.warning("You need at least 2 participants to form a team.")
+            st.warning("You need at least 2 participants in the Excel file to form a team.")
             return
 
         # Move to teams screen where pairs are shown
@@ -495,7 +616,6 @@ def page_teams() -> None:
         st.rerun()
 
     st.subheader("Step 2 · Teams")
-    st.caption("These are the randomly generated doubles teams from your participant list.")
 
     teams = st.session_state.teams
     with st.container():
@@ -548,7 +668,6 @@ def page_groups() -> None:
         st.rerun()
 
     st.subheader("Step 3 · Group teams")
-    st.caption("Teams are divided into exactly **4 groups** (as evenly as possible).")
 
     # Use existing groups if already created; otherwise create once
     if st.session_state.groups:
@@ -600,10 +719,11 @@ def page_schedule() -> None:
             st.rerun()
 
     st.subheader("Step 4 · Tournament schedule (Round 1 + Knockouts)")
-    st.caption("Round-robin within each group, then semi-finals at 4:00 PM and final at 4:30 PM.")
 
     if (
         not st.session_state.schedule
+        or "Index" not in (st.session_state.schedule[0] if st.session_state.schedule else {})
+        or "Court" not in (st.session_state.schedule[0] if st.session_state.schedule else {})
         or not any(str(row.get("Round", "")).startswith("Semi-final") for row in st.session_state.schedule)
     ):
         st.session_state.schedule = create_full_schedule(st.session_state.groups)
@@ -626,9 +746,9 @@ def page_schedule() -> None:
     if colors is None:
         st.info("Install `reportlab` to enable PDF export.")
     else:
-        def build_pdf_bytes(schedule_rows: List[dict]) -> bytes:
-            # Column order for both on-screen table and PDF export
-            columns = ["Round", "Match Time", "Group", "Team A", "Team B"]
+        def build_pdf_bytes(teams_rows: List[List[str]], groups_rows: List[List[List[str]]], schedule_rows: List[dict]) -> bytes:
+            # Column order for schedule section
+            schedule_columns = ["Index", "Round", "Match Time", "Court", "Group", "Team A", "Team B"]
 
             styles = getSampleStyleSheet()
             header_style = styles["Heading4"]
@@ -650,14 +770,25 @@ def page_schedule() -> None:
                     .replace(">", "&gt;")
                 )
 
-            data = [[Paragraph(col, header_style) for col in columns]]
-            for row in schedule_rows:
-                data.append(
-                    [
-                        Paragraph(esc(str(row.get(col, ""))), cell_style)
-                        for col in columns
-                    ]
+            def make_table(data_rows: List[List[Paragraph]], col_widths: List[int]) -> Table:
+                table = Table(data_rows, colWidths=col_widths, repeatRows=1)
+                table.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), colors.white),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                            ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+                            ("TEXTCOLOR", (0, 1), (-1, -1), colors.black),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                            ("TOPPADDING", (0, 0), (-1, -1), 2),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                        ]
+                    )
                 )
+                return table
 
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(
@@ -669,30 +800,46 @@ def page_schedule() -> None:
                 bottomMargin=18,
             )
 
-            # Approximate column widths for landscape page
-            col_widths = [62, 90, 70, 230, 230]
-            table = Table(data, colWidths=col_widths, repeatRows=1)
-            table.setStyle(
-                TableStyle(
+            elements = []
+
+            # Section 1: Teams
+            elements.append(Paragraph("Team List", header_style))
+            team_data: List[List[Paragraph]] = [[Paragraph("Team", header_style), Paragraph("Members", header_style)]]
+            for idx, team in enumerate(teams_rows, start=1):
+                team_data.append(
                     [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.white),
-                        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                        ("GRID", (0, 0), (-1, -1), 0.25, colors.black),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-                        ("TEXTCOLOR", (0, 1), (-1, -1), colors.black),
-                        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                        ("TOPPADDING", (0, 0), (-1, -1), 2),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                        Paragraph(esc(f"Team {idx}"), cell_style),
+                        Paragraph(esc(" & ".join(team)), cell_style),
                     ]
                 )
-            )
+            elements.append(make_table(team_data, [90, 568]))
+            elements.append(Spacer(1, 12))
 
-            doc.build([table])
+            # Section 2: Groups
+            elements.append(Paragraph("Group List", header_style))
+            group_data: List[List[Paragraph]] = [[Paragraph("Group", header_style), Paragraph("Teams", header_style)]]
+            for gi, group in enumerate(groups_rows, start=1):
+                teams_text = ", ".join([" & ".join(team) for team in group])
+                group_data.append(
+                    [
+                        Paragraph(esc(f"Group {gi}"), cell_style),
+                        Paragraph(esc(teams_text), cell_style),
+                    ]
+                )
+            elements.append(make_table(group_data, [90, 568]))
+            elements.append(Spacer(1, 12))
+
+            # Section 3: Match schedule
+            elements.append(Paragraph("Match Schedule", header_style))
+            schedule_data: List[List[Paragraph]] = [[Paragraph(col, header_style) for col in schedule_columns]]
+            for row in schedule_rows:
+                schedule_data.append([Paragraph(esc(str(row.get(col, ""))), cell_style) for col in schedule_columns])
+            elements.append(make_table(schedule_data, [30, 62, 70, 48, 58, 190, 190]))
+
+            doc.build(elements)
             return buffer.getvalue()
 
-        pdf_bytes = build_pdf_bytes(schedule)
+        pdf_bytes = build_pdf_bytes(st.session_state.teams, st.session_state.groups, schedule)
         st.download_button(
             label="Export schedule PDF",
             data=pdf_bytes,
@@ -735,6 +882,9 @@ def main() -> None:
     else:
         page_schedule()
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # Persist current state so browser refresh keeps progress.
+    save_persisted_state()
 
 
 if __name__ == "__main__":
